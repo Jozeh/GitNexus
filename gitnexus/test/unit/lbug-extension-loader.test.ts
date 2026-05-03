@@ -132,6 +132,47 @@ describe('ExtensionManager — install policies', () => {
 });
 
 describe('ExtensionManager — caching', () => {
+  it('single-flights concurrent ensure calls for the same extension and policy', async () => {
+    const manager = new ExtensionManager({ policy: 'load-only', warn: noopWarn });
+    let rejectLoad: ((err: Error) => void) | undefined;
+    const query = vi.fn(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectLoad = reject;
+        }),
+    );
+
+    const first = manager.ensure(query, 'fts', 'FTS');
+    const second = manager.ensure(query, 'fts', 'FTS');
+    rejectLoad?.(new Error('Extension "fts" not found'));
+
+    await expect(Promise.all([first, second])).resolves.toEqual([false, false]);
+    expect(query).toHaveBeenCalledOnce();
+  });
+
+  it('caches load-only unavailable state so later calls do not retry LOAD', async () => {
+    const manager = new ExtensionManager({ policy: 'load-only', warn: noopWarn });
+    const query = vi.fn().mockRejectedValue(new Error('Extension "fts" not found'));
+
+    await expect(manager.ensure(query, 'fts', 'FTS')).resolves.toBe(false);
+    await expect(manager.ensure(query, 'fts', 'FTS')).resolves.toBe(false);
+
+    expect(query).toHaveBeenCalledOnce();
+  });
+
+  it('propagates WAL assertion failures instead of caching extension unavailable', async () => {
+    const warn = vi.fn();
+    const manager = new ExtensionManager({ policy: 'load-only', warn });
+    const query = vi
+      .fn()
+      .mockRejectedValue(new Error('Assertion failed in wal_record.cpp: UNREACHABLE_CODE'));
+
+    await expect(manager.ensure(query, 'fts', 'FTS')).rejects.toThrow(/wal_record\.cpp/);
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(manager.getCapabilities()).toEqual([]);
+  });
+
   it('caches install attempt outcome to avoid retrying within the same process', async () => {
     const installExtension = vi.fn().mockResolvedValue(timedOutInstall);
     const manager = new ExtensionManager({

@@ -7,6 +7,8 @@
 
 import { queryFTS } from '../lbug/lbug-adapter.js';
 import { FTS_INDEXES } from './fts-schema.js';
+import { getExtensionCapabilities } from '../lbug/extension-loader.js';
+import { classifyNativeDbError } from '../lbug/native-errors.js';
 
 export interface BM25SearchResult {
   filePath: string;
@@ -14,6 +16,16 @@ export interface BM25SearchResult {
   rank: number;
   nodeIds?: string[];
 }
+
+const getUnavailableFtsReason = (): string | undefined =>
+  getExtensionCapabilities().find((cap) => cap.name.toLowerCase() === 'fts' && !cap.loaded)?.reason;
+
+const assertFTSCapable = (): void => {
+  const reason = getUnavailableFtsReason();
+  if (reason) {
+    throw new Error(`FTS extension load failure: ${reason}`);
+  }
+};
 
 /**
  * Execute a single FTS query via a custom executor (for MCP connection pool).
@@ -45,7 +57,8 @@ async function queryFTSViaExecutor(
         nodeId: node.nodeId || node.id || '',
       };
     });
-  } catch {
+  } catch (err) {
+    if (classifyNativeDbError(err)) throw err;
     return [];
   }
 }
@@ -67,6 +80,7 @@ export const searchFTSFromLbug = async (
   repoId?: string,
 ): Promise<BM25SearchResult[]> => {
   const resultsByIndex: any[][] = [];
+  assertFTSCapable();
 
   if (repoId) {
     // Use MCP connection pool via dynamic import
@@ -82,7 +96,12 @@ export const searchFTSFromLbug = async (
   } else {
     // Use core lbug adapter (CLI / pipeline context) — also sequential for safety.
     for (const { table, indexName } of FTS_INDEXES) {
-      resultsByIndex.push(await queryFTS(table, indexName, query, limit, false).catch(() => []));
+      try {
+        resultsByIndex.push(await queryFTS(table, indexName, query, limit, false));
+      } catch (err) {
+        if (classifyNativeDbError(err)) throw err;
+        resultsByIndex.push([]);
+      }
     }
   }
 

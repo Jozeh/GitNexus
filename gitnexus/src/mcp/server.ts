@@ -27,6 +27,7 @@ import { GITNEXUS_TOOLS } from './tools.js';
 import { realStdoutWrite } from './core/lbug-adapter.js';
 import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
+import { classifyNativeDbError, formatNativeDbErrorForTool } from '../core/lbug/native-errors.js';
 
 /**
  * Next-step hints appended to tool responses.
@@ -140,12 +141,13 @@ export function createMCPServer(backend: LocalBackend): Server {
         ],
       };
     } catch (err: any) {
+      const message = classifyNativeDbError(err) ? formatNativeDbErrorForTool(err) : err.message;
       return {
         contents: [
           {
             uri,
             mimeType: 'text/plain',
-            text: `Error: ${err.message}`,
+            text: `Error: ${message}`,
           },
         ],
       };
@@ -180,7 +182,11 @@ export function createMCPServer(backend: LocalBackend): Server {
         ],
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
+      const message = classifyNativeDbError(error)
+        ? formatNativeDbErrorForTool(error)
+        : error instanceof Error
+          ? error.message
+          : 'Unknown error';
       return {
         content: [
           {

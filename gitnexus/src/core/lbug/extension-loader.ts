@@ -1,6 +1,7 @@
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'node:url';
 import { LBUG_MAX_DB_SIZE } from './lbug-config.js';
+import { isWalCorruptionError } from './native-errors.js';
 
 const DEFAULT_EXTENSION_INSTALL_TIMEOUT_MS = 15_000;
 const EXTENSION_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_]*$/;
@@ -152,6 +153,7 @@ export const installDuckDbExtensionOutOfProcess = async (
 export class ExtensionManager {
   private readonly capabilities = new Map<string, ExtensionCapability>();
   private readonly installAttempted = new Map<string, ExtensionInstallResult>();
+  private readonly inFlight = new Map<string, Promise<boolean>>();
   private readonly warnedKeys = new Set<string>();
 
   constructor(private readonly options: ExtensionManagerOptions = {}) {}
@@ -160,6 +162,7 @@ export class ExtensionManager {
   reset(): void {
     this.capabilities.clear();
     this.installAttempted.clear();
+    this.inFlight.clear();
     this.warnedKeys.clear();
   }
 
@@ -189,67 +192,117 @@ export class ExtensionManager {
     const timeoutMs =
       opts.installTimeoutMs ?? this.options.installTimeoutMs ?? getExtensionInstallTimeoutMs();
     const warn = this.options.warn ?? console.warn;
+    const key = name.toLowerCase();
+    const flightKey = `${key}:${policy}`;
 
+    const existingFlight = this.inFlight.get(flightKey);
+    if (existingFlight) return existingFlight;
+
+    const promise = this.ensureOnce(query, key, name, label, policy, timeoutMs, warn);
+    this.inFlight.set(flightKey, promise);
+    try {
+      return await promise;
+    } finally {
+      this.inFlight.delete(flightKey);
+    }
+  }
+
+  private async ensureOnce(
+    query: (sql: string) => Promise<unknown>,
+    key: string,
+    name: string,
+    label: string,
+    policy: ExtensionInstallPolicy,
+    timeoutMs: number,
+    warn: (message: string) => void,
+  ): Promise<boolean> {
     if (policy === 'never') {
-      this.markUnavailable(name, label, 'extension install policy is "never"', warn);
+      this.markUnavailable(key, name, label, 'extension install policy is "never"', warn);
       return false;
     }
 
-    if (await this.tryLoad(query, name)) {
-      this.markLoaded(name);
+    const cached = this.capabilities.get(key);
+    if (cached?.loaded === false) {
+      if (policy !== 'auto' || !cached.reason?.startsWith('load-only policy')) {
+        return false;
+      }
+      this.capabilities.delete(key);
+    }
+
+    const loaded = await this.tryLoad(query, name);
+    if (loaded.loaded) {
+      this.markLoaded(key, name);
       return true;
     }
 
     if (policy === 'load-only') {
-      this.markUnavailable(name, label, 'load-only policy: extension not pre-installed', warn);
+      this.markUnavailable(
+        key,
+        name,
+        label,
+        `load-only policy: extension not pre-installed${loaded.reason ? ` (${loaded.reason})` : ''}`,
+        warn,
+      );
       return false;
     }
 
-    let install = this.installAttempted.get(name);
+    let install = this.installAttempted.get(key);
     if (!install) {
       const installFn = this.options.installExtension ?? installDuckDbExtensionOutOfProcess;
       install = await installFn(name, timeoutMs);
-      this.installAttempted.set(name, install);
+      this.installAttempted.set(key, install);
     }
 
     if (!install.success) {
-      this.markUnavailable(name, label, install.message, warn);
+      this.markUnavailable(key, name, label, install.message, warn);
       return false;
     }
 
-    if (await this.tryLoad(query, name)) {
-      this.markLoaded(name);
+    const retryLoaded = await this.tryLoad(query, name);
+    if (retryLoaded.loaded) {
+      this.markLoaded(key, name);
       return true;
     }
 
-    this.markUnavailable(name, label, `LOAD ${name} failed after successful INSTALL`, warn);
+    this.markUnavailable(
+      key,
+      name,
+      label,
+      `LOAD ${name} failed after successful INSTALL${retryLoaded.reason ? ` (${retryLoaded.reason})` : ''}`,
+      warn,
+    );
     return false;
   }
 
-  private async tryLoad(query: (sql: string) => Promise<unknown>, name: string): Promise<boolean> {
+  private async tryLoad(
+    query: (sql: string) => Promise<unknown>,
+    name: string,
+  ): Promise<{ loaded: boolean; reason?: string }> {
     try {
       await query(`LOAD EXTENSION ${name}`);
-      return true;
+      return { loaded: true };
     } catch (err) {
+      if (isWalCorruptionError(err)) throw err;
       const msg = err instanceof Error ? err.message : String(err);
-      return alreadyAvailable(msg);
+      return alreadyAvailable(msg) ? { loaded: true } : { loaded: false, reason: msg };
     }
   }
 
-  private markLoaded(name: string): void {
-    this.capabilities.set(name, { name, loaded: true });
+  private markLoaded(key: string, name: string): void {
+    this.capabilities.set(key, { name, loaded: true });
   }
 
   private markUnavailable(
+    key: string,
     name: string,
     label: string,
     reason: string,
     warn: (message: string) => void,
   ): void {
-    this.capabilities.set(name, { name, loaded: false, reason });
-    const key = `${name}:${reason}`;
-    if (this.warnedKeys.has(key)) return;
-    this.warnedKeys.add(key);
+    this.capabilities.set(key, { name, loaded: false, reason });
+    const warnKey = `${key}:${reason}`;
+    if (this.warnedKeys.has(warnKey)) return;
+    this.warnedKeys.add(warnKey);
     warn(
       `GitNexus: ${label} extension unavailable; continuing without ${label} features. ${reason}`,
     );

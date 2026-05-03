@@ -19,6 +19,7 @@ import fs from 'fs/promises';
 import lbug from '@ladybugdb/core';
 import { loadFTSExtension } from './lbug-adapter.js';
 import { createLbugDatabase } from './lbug-config.js';
+import { runWithWalRecovery } from './native-errors.js';
 
 /** Per-repo pool: one Database, many Connections */
 interface PoolEntry {
@@ -74,6 +75,20 @@ interface SharedDB {
   external?: boolean;
 }
 const dbCache = new Map<string, SharedDB>();
+
+const closeConnectionsBestEffort = (connections: lbug.Connection[]): void => {
+  for (const conn of connections) {
+    conn.close().catch(() => {});
+  }
+  connections.length = 0;
+};
+
+const closeUnusedSharedDb = async (dbPath: string): Promise<void> => {
+  const shared = dbCache.get(dbPath);
+  if (!shared || shared.refCount > 0 || shared.external) return;
+  await shared.db.close().catch(() => {});
+  dbCache.delete(dbPath);
+};
 
 /** Max repos in the pool (LRU eviction) */
 const MAX_POOL_SIZE = 5;
@@ -295,6 +310,32 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
 
   evictLRU();
 
+  const { shared, available } = await runWithWalRecovery(
+    dbPath,
+    () => createPoolResources(repoId, dbPath),
+    { cleanup: () => closeUnusedSharedDb(dbPath) },
+  );
+  const db = shared.db;
+
+  // Register pool entry only after all connections are pre-warmed and FTS is
+  // loaded.  Concurrent executeQuery calls see either "not initialized"
+  // (and throw cleanly) or a fully ready pool — never a half-built one.
+  pool.set(repoId, {
+    db,
+    available,
+    checkedOut: 0,
+    waiters: [],
+    lastUsed: Date.now(),
+    dbPath,
+    closed: false,
+  });
+  ensureIdleTimer();
+}
+
+async function createPoolResources(
+  repoId: string,
+  dbPath: string,
+): Promise<{ shared: SharedDB; available: lbug.Connection[] }> {
   // Reuse an existing native Database if another repoId already opened this path.
   // This prevents buffer manager exhaustion from multiple mmap regions on the same file.
   let shared = dbCache.get(dbPath);
@@ -331,43 +372,38 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
 
   shared.refCount++;
   const db = shared.db;
+  const available: lbug.Connection[] = [];
 
   // Pre-create the full pool upfront so createConnection() (which silences
   // stdout) is never called lazily during active query execution.
   // Mark preWarmActive so the watchdog timer doesn't interfere.
-  preWarmActive = true;
-  const available: lbug.Connection[] = [];
   try {
-    for (let i = 0; i < MAX_CONNS_PER_REPO; i++) {
-      available.push(createConnection(db));
+    preWarmActive = true;
+    try {
+      for (let i = 0; i < MAX_CONNS_PER_REPO; i++) {
+        available.push(createConnection(db));
+      }
+    } finally {
+      preWarmActive = false;
     }
-  } finally {
-    preWarmActive = false;
-  }
 
-  // Load FTS extension once per shared Database.
-  // Done BEFORE pool registration so no concurrent checkout can grab
-  // the connection while the async FTS load is in progress.
-  // policy: 'load-only' — the read pool must never trigger a network
-  // install; analyze owns extension installation. If LOAD fails, search
-  // features degrade gracefully and the user-facing query path proceeds.
-  if (!shared.ftsLoaded) {
-    shared.ftsLoaded = await loadFTSExtension(available[0], { policy: 'load-only' });
-  }
+    // Load FTS extension once per shared Database.
+    // Done BEFORE pool registration so no concurrent checkout can grab
+    // the connection while the async FTS load is in progress.
+    // policy: 'load-only' — the read pool must never trigger a network
+    // install; analyze owns extension installation. If LOAD fails, search
+    // features degrade gracefully and the user-facing query path proceeds.
+    if (!shared.ftsLoaded) {
+      shared.ftsLoaded = await loadFTSExtension(available[0], { policy: 'load-only' });
+    }
 
-  // Register pool entry only after all connections are pre-warmed and FTS is
-  // loaded.  Concurrent executeQuery calls see either "not initialized"
-  // (and throw cleanly) or a fully ready pool — never a half-built one.
-  pool.set(repoId, {
-    db,
-    available,
-    checkedOut: 0,
-    waiters: [],
-    lastUsed: Date.now(),
-    dbPath,
-    closed: false,
-  });
-  ensureIdleTimer();
+    return { shared, available };
+  } catch (err) {
+    closeConnectionsBestEffort(available);
+    shared.refCount--;
+    await closeUnusedSharedDb(dbPath);
+    throw err;
+  }
 }
 
 /**

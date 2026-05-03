@@ -23,6 +23,7 @@ import {
   type LbugConnectionHandle,
 } from './lbug-config.js';
 import { isVectorExtensionSupportedByPlatform } from '../platform/capabilities.js';
+import { isWalCorruptionError, runWithWalRecovery } from './native-errors.js';
 
 // ---------------------------------------------------------------------------
 // Relationship CSV splitting — extracted for testability (PR #818)
@@ -291,7 +292,7 @@ const ensureLbugInitialized = async (dbPath: string) => {
   return { db, conn };
 };
 
-const doInitLbug = async (dbPath: string) => {
+const resetLbugHandles = async (): Promise<void> => {
   // Different database requested — close the old one first
   if (conn || db) {
     try {
@@ -307,6 +308,16 @@ const doInitLbug = async (dbPath: string) => {
     vectorExtensionLoaded = false;
     ensuredFTSIndexes.clear();
   }
+};
+
+const doInitLbug = async (dbPath: string) => {
+  return runWithWalRecovery(dbPath, () => doInitLbugOnce(dbPath), {
+    cleanup: resetLbugHandles,
+  });
+};
+
+const doInitLbugOnce = async (dbPath: string) => {
+  await resetLbugHandles();
 
   // LadybugDB stores the database as a single file (not a directory).
   // If the path already exists, it must be a valid LadybugDB database file.
@@ -346,6 +357,7 @@ const doInitLbug = async (dbPath: string) => {
     try {
       await conn.query(schemaQuery);
     } catch (err) {
+      if (isWalCorruptionError(err)) throw err;
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.includes('already exists')) {
         console.warn(`⚠️ Schema creation warning: ${msg.slice(0, 120)}`);

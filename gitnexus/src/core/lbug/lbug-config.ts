@@ -1,4 +1,5 @@
 import type lbug from '@ladybugdb/core';
+import { runWithWalRecovery } from './native-errors.js';
 
 /**
  * Shared configuration for `@ladybugdb/core` `Database` construction.
@@ -72,14 +73,16 @@ export async function openLbugConnection(
   databasePath: string,
   options: LbugDatabaseOptions = {},
 ): Promise<LbugConnectionHandle> {
-  let db: lbug.Database | undefined;
-  try {
-    db = createLbugDatabase(lbugModule, databasePath, options);
-    return { db, conn: new lbugModule.Connection(db) };
-  } catch (err) {
-    if (db) await db.close().catch(() => {});
-    throw err;
-  }
+  return runWithWalRecovery(databasePath, async () => {
+    let db: lbug.Database | undefined;
+    try {
+      db = createLbugDatabase(lbugModule, databasePath, options);
+      return { db, conn: new lbugModule.Connection(db) };
+    } catch (err) {
+      if (db) await db.close().catch(() => {});
+      throw err;
+    }
+  });
 }
 
 export async function closeLbugConnection(handle: LbugConnectionHandle): Promise<void> {

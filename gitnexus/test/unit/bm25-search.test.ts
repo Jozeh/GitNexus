@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { searchFTSFromLbug, type BM25SearchResult } from '../../src/core/search/bm25-index.js';
+import { extensionManager, resetExtensionState } from '../../src/core/lbug/extension-loader.js';
 
 vi.mock('../../src/core/lbug/lbug-adapter.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/core/lbug/lbug-adapter.js')>();
@@ -20,6 +21,10 @@ vi.mock('../../src/core/lbug/pool-adapter.js', () => ({
 }));
 
 describe('BM25 search', () => {
+  beforeEach(() => {
+    resetExtensionState();
+  });
+
   describe('createSearchFTSIndexes', () => {
     beforeEach(() => {
       vi.clearAllMocks();
@@ -57,6 +62,22 @@ describe('BM25 search', () => {
     it('accepts custom limit parameter', async () => {
       const results = await searchFTSFromLbug('test', 5);
       expect(Array.isArray(results)).toBe(true);
+    });
+
+    it('surfaces cached FTS capability-unavailable state to callers', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        await extensionManager.ensure(
+          vi.fn().mockRejectedValue(new Error('Extension "fts" not found')),
+          'fts',
+          'FTS',
+          { policy: 'load-only' },
+        );
+
+        await expect(searchFTSFromLbug('test', 5)).rejects.toThrow(/FTS extension load failure/);
+      } finally {
+        warn.mockRestore();
+      }
     });
   });
 

@@ -35,6 +35,7 @@ import {
   type ExactEmbeddingRow,
 } from '../../core/embeddings/exact-search.js';
 import { EMBEDDING_TABLE_NAME, EMBEDDING_INDEX_NAME } from '../../core/lbug/schema.js';
+import { classifyNativeDbError, nativeDbErrorPayload } from '../../core/lbug/native-errors.js';
 import {
   getExactScanLimit,
   isVectorExtensionSupportedByPlatform,
@@ -990,6 +991,8 @@ export class LocalBackend {
     try {
       bm25Results = await searchFTSFromLbug(query, limit, repo.id);
     } catch (err: any) {
+      const native = classifyNativeDbError(err);
+      if (native && native.code !== 'LBUG_FTS_UNAVAILABLE') throw err;
       console.error('GitNexus: BM25/FTS search failed (FTS indexes may not exist) -', err.message);
       return { results: [], ftsUsed: false };
     }
@@ -1105,7 +1108,9 @@ export class LocalBackend {
               distance: row.distance ?? row[4],
             }));
           });
-        } catch {
+        } catch (err) {
+          const native = classifyNativeDbError(err);
+          if (native && native.code !== 'LBUG_VECTOR_UNAVAILABLE') throw err;
           bestChunks = new Map();
         }
       } else if (!this.warnedVectorUnsupported) {
@@ -1186,7 +1191,8 @@ export class LocalBackend {
       }
 
       return results;
-    } catch {
+    } catch (err) {
+      if (classifyNativeDbError(err)) throw err;
       // Expected when embeddings are disabled — silently fall back to BM25-only
       return [];
     }
@@ -1216,6 +1222,9 @@ export class LocalBackend {
       const result = await executeQuery(repo.id, params.query);
       return result;
     } catch (err: any) {
+      if (classifyNativeDbError(err)) {
+        return nativeDbErrorPayload(err, 'Query failed');
+      }
       return { error: err.message || 'Query failed' };
     }
   }
@@ -2423,9 +2432,17 @@ export class LocalBackend {
     try {
       return await this._impactImpl(repo, params);
     } catch (err: any) {
+      const native = classifyNativeDbError(err);
+      const payload = native ? nativeDbErrorPayload(err, 'Impact analysis failed') : null;
       // Return structured error instead of crashing (#321)
       return {
-        error: (err instanceof Error ? err.message : String(err)) || 'Impact analysis failed',
+        error:
+          payload?.error ||
+          (err instanceof Error ? err.message : String(err)) ||
+          'Impact analysis failed',
+        ...(payload?.code ? { code: payload.code } : {}),
+        ...(payload?.recovery ? { recovery: payload.recovery } : {}),
+        ...(payload?.details ? { details: payload.details } : {}),
         target: { name: params.target },
         direction: params.direction,
         impactedCount: 0,

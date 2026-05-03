@@ -113,6 +113,36 @@ describe('server error handling', () => {
     // Server was created with version from package.json — no crash
     expect(server).toBeDefined();
   });
+
+  it('returns clean tool errors for known native DB failures without closing transport', async () => {
+    const backend = createMockBackend({
+      callTool: vi
+        .fn()
+        .mockRejectedValueOnce(
+          new Error('Runtime exception: Corrupted wal file. Read out invalid WAL record type.'),
+        )
+        .mockResolvedValueOnce({ result: 'still alive' }),
+    });
+    const server = createMCPServer(backend);
+    const client = new Client({ name: 'test-client', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+      const failed: any = await client.callTool({ name: 'query', arguments: { query: 'auth' } });
+      expect(failed.isError).toBe(true);
+      expect(failed.content[0].text).toContain('LBUG_WAL_CORRUPT');
+      expect(failed.content[0].text).toContain('Remove the repository .gitnexus directory');
+
+      const alive: any = await client.callTool({ name: 'list_repos', arguments: {} });
+      expect(alive.isError).not.toBe(true);
+      expect(alive.content[0].text).toContain('still alive');
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
 });
 
 // ─── Prompt definitions ───────────────────────────────────────────────

@@ -23,6 +23,7 @@ import {
   withLbugDb,
 } from '../core/lbug/lbug-adapter.js';
 import { isWriteQuery } from '../core/lbug/pool-adapter.js';
+import { classifyNativeDbError, nativeDbErrorPayload } from '../core/lbug/native-errors.js';
 import { NODE_TABLES, type GraphNode, type GraphRelationship } from 'gitnexus-shared';
 import { searchFTSFromLbug } from '../core/search/bm25-index.js';
 import { hybridSearch } from '../core/search/hybrid-search.js';
@@ -512,6 +513,20 @@ const statusFromError = (err: any): number => {
   return 500;
 };
 
+const statusFromNativeDbError = (err: unknown): number => {
+  const classified = classifyNativeDbError(err);
+  if (!classified) return 500;
+  return classified.code === 'LBUG_LOCKED' ? 409 : 503;
+};
+
+const formatNativeJobError = (err: unknown, fallback: string): string => {
+  const payload = nativeDbErrorPayload(err, fallback);
+  const prefix = payload.code ? `[${payload.code}] ` : '';
+  const recovery = payload.recovery ? ` Recovery: ${payload.recovery}` : '';
+  const details = payload.details ? ` Details: ${payload.details}` : '';
+  return `${prefix}${payload.error}${recovery}${details}`;
+};
+
 const requestedRepo = (req: express.Request): string | undefined => {
   const fromQuery = typeof req.query.repo === 'string' ? req.query.repo : undefined;
   if (fromQuery) return fromQuery;
@@ -892,6 +907,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const result = await withLbugDb(lbugPath, () => executeQuery(cypher));
       res.json({ result });
     } catch (err: any) {
+      if (classifyNativeDbError(err)) {
+        res.status(statusFromNativeDbError(err)).json(nativeDbErrorPayload(err, 'Query failed'));
+        return;
+      }
       res.status(500).json({ error: err.message || 'Query failed' });
     }
   });
@@ -1041,6 +1060,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       });
       res.json({ results });
     } catch (err: any) {
+      if (classifyNativeDbError(err)) {
+        res.status(200).json({
+          results: [],
+          degraded: true,
+          ...nativeDbErrorPayload(err, 'Search failed'),
+        });
+        return;
+      }
       res.status(500).json({ error: err.message || 'Search failed' });
     }
   });
@@ -1604,7 +1631,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           if (!current || current.status !== 'failed') {
             embedJobManager.updateJob(job.id, {
               status: 'failed',
-              error: err.message || 'Embedding generation failed',
+              error: classifyNativeDbError(err)
+                ? formatNativeJobError(err, 'Embedding generation failed')
+                : err.message || 'Embedding generation failed',
             });
           }
         }
@@ -1614,6 +1643,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     } catch (err: any) {
       if (err.message?.includes('already in progress')) {
         res.status(409).json({ error: err.message });
+      } else if (classifyNativeDbError(err)) {
+        res
+          .status(statusFromNativeDbError(err))
+          .json(nativeDbErrorPayload(err, 'Failed to start embedding generation'));
       } else {
         res.status(500).json({ error: err.message || 'Failed to start embedding generation' });
       }

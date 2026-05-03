@@ -78,6 +78,7 @@ import {
   isLbugReady,
   closeLbug,
 } from '../../src/mcp/core/lbug-adapter.js';
+import { searchFTSFromLbug } from '../../src/core/search/bm25-index.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -193,6 +194,18 @@ describe('LocalBackend.callTool', () => {
     expect(result).toHaveProperty('definitions');
   });
 
+  it('query tool returns a degraded warning when FTS is unavailable', async () => {
+    (searchFTSFromLbug as any).mockRejectedValueOnce(
+      new Error('FTS extension load failure: Extension "fts" not found'),
+    );
+    (executeParameterized as any).mockResolvedValue([]);
+
+    const result = await backend.callTool('query', { query: 'auth' });
+
+    expect(result).toHaveProperty('processes');
+    expect(result.warning).toContain('FTS extension unavailable');
+  });
+
   it('skips vector index query when VECTOR is unsupported by the platform', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(false);
@@ -266,6 +279,20 @@ describe('LocalBackend.callTool', () => {
     expect(result).toHaveProperty('markdown');
     expect(result).toHaveProperty('row_count');
     expect(result.row_count).toBe(1);
+  });
+
+  it('cypher tool returns structured native DB errors', async () => {
+    (executeQuery as any).mockRejectedValueOnce(
+      new Error('Runtime exception: Corrupted wal file. Read out invalid WAL record type.'),
+    );
+
+    const result = await backend.callTool('cypher', {
+      query: 'MATCH (n:Function) RETURN n.name LIMIT 5',
+    });
+
+    expect(result.error).toContain('WAL');
+    expect(result.code).toBe('LBUG_WAL_CORRUPT');
+    expect(result.recovery).toContain('Remove the repository .gitnexus directory');
   });
 
   it('dispatches context tool', async () => {
@@ -538,6 +565,19 @@ describe('LocalBackend.callTool', () => {
     const result = await backend.callTool('impact', { target: 'main', direction: 'upstream' });
     expect(result).toBeDefined();
     expect(result.target).toBeDefined();
+  });
+
+  it('impact tool preserves structured native DB error details', async () => {
+    (executeParameterized as any).mockRejectedValueOnce(
+      new Error('Assertion failed in wal_record.cpp: UNREACHABLE_CODE'),
+    );
+
+    const result = await backend.callTool('impact', { target: 'main', direction: 'upstream' });
+
+    expect(result.error).toContain('WAL');
+    expect(result.code).toBe('LBUG_WAL_CORRUPT');
+    expect(result.recovery).toContain('Remove the repository .gitnexus directory');
+    expect(result.risk).toBe('UNKNOWN');
   });
 
   it('dispatches detect_changes tool', async () => {
