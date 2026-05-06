@@ -15,7 +15,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { createMCPServer } from '../../src/mcp/server.js';
+import { createMCPServer, mcpShutdownExitCode } from '../../src/mcp/server.js';
 import { GITNEXUS_TOOLS } from '../../src/mcp/tools.js';
 
 // ─── Mock backend ──────────────────────────────────────────────────
@@ -142,6 +142,16 @@ describe('server error handling', () => {
       await client.close();
       await server.close();
     }
+  });
+});
+
+describe('MCP stdio shutdown', () => {
+  it('maps signal reasons to numeric process exit codes', () => {
+    expect(mcpShutdownExitCode()).toBe(0);
+    expect(mcpShutdownExitCode(1)).toBe(1);
+    expect(mcpShutdownExitCode('SIGINT')).toBe(130);
+    expect(mcpShutdownExitCode('SIGTERM')).toBe(143);
+    expect(mcpShutdownExitCode('SIGHUP')).toBe(1);
   });
 });
 

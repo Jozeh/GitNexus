@@ -78,6 +78,21 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
   }
 }
 
+export function mcpShutdownExitCode(reason: number | NodeJS.Signals | undefined = 0): number {
+  if (typeof reason === 'number') return reason;
+
+  switch (reason) {
+    case 'SIGINT':
+      return 130;
+    case 'SIGTERM':
+      return 143;
+    case undefined:
+      return 0;
+    default:
+      return 1;
+  }
+}
+
 /**
  * Create a configured MCP Server with all handlers registered.
  * Transport-agnostic — caller connects the desired transport.
@@ -308,9 +323,10 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
 
   // Graceful shutdown helper
   let shuttingDown = false;
-  const shutdown = async (exitCode = 0) => {
+  const shutdown = async (reason: number | NodeJS.Signals | undefined = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    const exitCode = mcpShutdownExitCode(reason);
     try {
       await backend.disconnect();
     } catch {}
